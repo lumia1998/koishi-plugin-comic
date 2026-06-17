@@ -1,0 +1,37 @@
+{
+  "name": "koishi-plugin-comic",
+  "description": "聚合漫画搜索与下载插件，支持禁漫天堂和哔咔漫画，需要自部署 comic-api 后端",
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "comic",
+    "jmcomic",
+    "bika"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.0.0"
+  },
+  "koishi": {
+    "service": {
+      "required": [
+        "http"
+      ]
+    }
+  },
+  "dependencies": {
+    "@koishijs/plugin-http": "^0.6.0"
+  },
+  "devDependencies": {
+    "koishi": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
