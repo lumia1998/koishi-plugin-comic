@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-comic",
   "description": "聚合漫画搜索与下载插件，支持禁漫天堂和哔咔漫画，需要自部署 comic-api 后端",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -17,6 +17,9 @@
     "url": "https://github.com/lumia1998/koishi-plugin-comic/issues"
   },
   "homepage": "https://github.com/lumia1998/koishi-plugin-comic#readme",
+  "contributors": [
+    "lumia.wang <fenglian19980510@gmail.com>"
+  ],
   "keywords": [
     "chatbot",
     "koishi",
