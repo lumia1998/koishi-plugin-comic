@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-comic",
-  "description": "聚合漫画搜索与下载插件，支持禁漫天堂和哔咔漫画，需要自部署 comic-api 后端",
-  "version": "1.0.3",
+  "description": "聚合漫画搜索与下载插件，支持禁漫天堂和哔咔漫画，需要自部署 comic-api 后端。支持 ChatLuna 工具调用。",
+  "version": "1.0.6",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -26,15 +26,25 @@
     "plugin",
     "comic",
     "jmcomic",
-    "bika"
+    "bika",
+    "chatluna"
   ],
   "peerDependencies": {
-    "koishi": "^4.0.0"
+    "koishi": "^4.18.0",
+    "koishi-plugin-chatluna": "^1.0.3"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-chatluna": {
+      "optional": true
+    }
   },
   "koishi": {
     "service": {
       "required": [
         "http"
+      ],
+      "optional": [
+        "chatluna"
       ]
     }
   },
@@ -42,7 +52,9 @@
     "@koishijs/plugin-http": "^0.6.0"
   },
   "devDependencies": {
-    "koishi": "^4.0.0",
-    "typescript": "^5.0.0"
+    "@langchain/core": "^0.3.80",
+    "koishi": "^4.18.0",
+    "typescript": "^5.0.0",
+    "zod": "3.25.76"
   }
 }
