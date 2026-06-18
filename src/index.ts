@@ -29,18 +29,17 @@ export const usage = `
 <h3>命令列表</h3>
 <ul>
   <li><code>comic [关键词]</code> - 聚合搜索/直接下载漫画</li>
-  <li><code>comic search &lt;关键词&gt;</code> - 聚合搜索漫画</li>
+  <li><code>comic search &lt;关键词/ID&gt;</code> - 聚合搜索漫画，各平台最多8条，合并转发并标注来源</li>
   <li><code>comic download &lt;ID&gt; [章节ID]</code> - 下载漫画PDF</li>
-  <li><code>comic detail &lt;关键词/ID&gt;</code> - 查看漫画详情</li>
-  <li><code>comic leaderboard [类型]</code> - 排行榜</li>
-  <li><code>comic latest</code> - 最近更新</li>
-  <li><code>comic random</code> - 随机推荐</li>
+  <li><code>comic detail &lt;关键词/ID&gt;</code> - 查看漫画详情，关键词模式下双平台各展示最相似结果</li>
+  <li><code>comic leaderboard [类型] [页码]</code> - 排行榜(类型: day/week/month/total，默认day)，双平台分2条发送</li>
+  <li><code>comic latest [-n 数量]</code> - 最近更新，每平台默认10条(最多50)，双平台分2条发送</li>
+  <li><code>comic random [-n 数量]</code> - 随机推荐，每平台默认5个(最多20)，双平台分2条发送</li>
 </ul>
 `
 
 export interface Config {
   apiBase: string
-  defaultSource: 'jm' | 'bika'
   concurrency: number
   logInfo: boolean
   pdfPassword?: string
@@ -57,11 +56,9 @@ export const Config = Schema.object({
   apiBase: Schema.string()
     .description('comic-api 后端地址')
     .default('http://127.0.0.1:8699'),
-  defaultSource: Schema.union(['jm', 'bika'] as const)
-    .description('默认漫画源')
-    .default('jm'),
   concurrency: Schema.number()
-    .description('下载并发数')
+    .min(1).max(16)
+    .description('下载并发数 (1-16)')
     .default(4),
   logInfo: Schema.boolean()
     .description('打印 API 调用日志')
@@ -143,14 +140,6 @@ interface ApiResponse<T = any> {
   error?: string
 }
 
-function formatComics(comics: ComicItem[], sourceLabel: string = ''): string {
-  if (!comics || comics.length === 0) return '没有找到相关漫画。'
-  return comics.map((c, i) => {
-    const src = c.source === 'jm' ? '禁漫天堂' : c.source === 'bika' ? '哔咔漫画' : sourceLabel
-    return `${i + 1}. [${src}] ${c.title}  作者:${c.author || '佚名'}`
-  }).join('\n')
-}
-
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('comic')
 
@@ -161,9 +150,23 @@ export function apply(ctx: Context, config: Config) {
       if (qs) url += '?' + qs
     }
     if (config.logInfo) logger.info(`GET ${url}`)
-    const res = await ctx.http.get(url)
-    return res as T
+    try {
+      const res = await ctx.http.get(url)
+      // 后端统一错误格式：{ success: false, error: '...' }
+      if (res && typeof res === 'object' && (res as any).success === false) {
+        const msg = (res as any).error || '后端返回未知错误'
+        logger.warn(`API 返回失败 [${url}]: ${msg}`)
+        throw new Error(msg)
+      }
+      return res as T
+    } catch (err: any) {
+      logger.error(`API 请求失败 [${url}]: ${err.message}`)
+      throw err
+    }
   }
+
+  // 子命令关键词集合，用于父命令路由时排除（避免被当作搜索词/下载ID）
+  const SUBCOMMANDS = ['search', 'download', 'detail', 'leaderboard', 'latest', 'random']
 
   // Parent command 'comic' routing logic
   ctx.command('comic [keyword:text]', '聚合漫画搜索与直接下载')
@@ -173,24 +176,34 @@ export function apply(ctx: Context, config: Config) {
         return session.execute('help comic')
       }
       const clean = keyword.trim()
-      
+
+      // 关键修复：当 keyword 以子命令名开头时，强制用点号形式转发到子命令。
+      // Koishi 的 `comic [keyword:text]` 贪婪参数会吞掉 `comic random` / `comic latest`
+      // 这类无参子命令，导致它们被当作搜索词处理。
+      const parts = clean.split(/\s+/)
+      const firstWord = parts[0].toLowerCase()
+      if (SUBCOMMANDS.includes(firstWord)) {
+        const rest = parts.slice(1).join(' ')
+        return session.execute(`comic.${firstWord}${rest ? ' ' + rest : ''}`)
+      }
+
       const resolved = determineSource(clean)
       if (resolved) {
         if (resolved.source === 'jm' && parseInt(resolved.id, 10) <= 100) {
-          return session.execute(`comic search ${keyword}`)
+          return session.execute(`comic.search ${keyword}`)
         }
-        return session.execute(`comic download ${resolved.id}`)
+        return session.execute(`comic.download ${resolved.id}`)
       }
-      
+
       // Fallback to search
-      return session.execute(`comic search ${keyword}`)
+      return session.execute(`comic.search ${keyword}`)
     })
 
-  async function fetchAndShowDetail(session: any, source: string, id: string): Promise<string | void> {
+  // 构建单个漫画的详情文本；失败返回 null
+  async function buildDetailText(source: string, id: string): Promise<string | null> {
     try {
-      await session.send('正在获取详情...')
       const detail = await apiGet<ComicDetail>(`/api/comic/${source}/${id}`)
-      if (!detail?.title) return '未找到该漫画'
+      if (!detail?.title) return null
 
       const srcLabel = source === 'jm' ? '禁漫天堂' : '哔咔漫画'
       const parts = [
@@ -203,21 +216,26 @@ export function apply(ctx: Context, config: Config) {
 
       if (detail.chapters?.length > 0) {
         const first = detail.chapters[0]
-        parts.push(`\n第一话: [${first.id}] ${first.name}`)
+        parts.push(`第一话: [${first.id}] ${first.name}`)
         if (detail.chapters.length > 1) {
           parts.push(`共 ${detail.chapters.length} 话，如需下载请使用 comic download <ID> [章节ID]`)
         }
       }
-
       return parts.join('\n')
     } catch (err: any) {
-      logger.error('获取详情失败:', err.message)
-      return `获取详情失败: ${err.message}`
+      logger.error(`获取详情失败 [${source}/${id}]:`, err.message)
+      return null
     }
   }
 
+  async function fetchAndShowDetail(session: any, source: string, id: string): Promise<string | void> {
+    await session.send('正在获取详情...')
+    const text = await buildDetailText(source, id)
+    return text || '未找到该漫画'
+  }
+
   // comic search <keyword>
-  ctx.command('comic search <keyword:text>', '聚合搜索漫画')
+  ctx.command('comic.search <keyword:text>', '聚合搜索漫画')
     .action(async ({ session }, keyword) => {
       if (!keyword) return '请输入搜索关键词'
 
@@ -253,116 +271,79 @@ export function apply(ctx: Context, config: Config) {
           result = await apiGet<SearchResult>('/api/search', { keyword })
         }
 
-        const parts: string[] = []
-
-        if (result.best_match?.title) {
-          const bm = result.best_match
-          const srcLabel = bm.source === 'jm' ? '禁漫天堂' : '哔咔漫画'
-          parts.push(`🏆 最佳匹配 [${srcLabel}]:`)
-          parts.push(`  ${bm.title}  作者:${bm.author || '佚名'}`)
-          parts.push('')
-        }
-
-        const jmList = result.all_results?.jm || []
-        const bikaList = result.all_results?.bika || []
-
-        const all: (ComicItem & { source: string })[] = []
-        const jmItems = jmList.map(c => ({ ...c, source: 'jm' }))
-        const bikaItems = bikaList.map(c => ({ ...c, source: 'bika' }))
-
+        // 各平台最多取 8 条
+        const jmItems = (result.all_results?.jm || []).slice(0, 8).map(c => ({ ...c, source: 'jm' }))
+        const bikaItems = (result.all_results?.bika || []).slice(0, 8).map(c => ({ ...c, source: 'bika' }))
         const totalResults = jmItems.length + bikaItems.length
 
-        if (totalResults > 0) {
-          if (totalResults > 5) {
-            parts.push(`共找到 ${totalResults} 个结果，已生成合并转发记录：`)
-            if (session) {
-              await session.send(parts.join('\n'))
-
-              const msgElements = []
-              let currentIndex = 1
-              if (jmItems.length > 0) {
-                msgElements.push(h('message', '【 禁漫天堂 (JMComic) 】'))
-                for (const item of jmItems) {
-                  all.push(item)
-                  msgElements.push(h('message', `  ${currentIndex}. [禁漫天堂] ${item.title}  作者:${item.author || '佚名'}`))
-                  currentIndex++
-                }
-              }
-              if (bikaItems.length > 0) {
-                msgElements.push(h('message', '【 哔咔漫画 (Bika) 】'))
-                for (const item of bikaItems) {
-                  all.push(item)
-                  msgElements.push(h('message', `  ${currentIndex}. [哔咔漫画] ${item.title}  作者:${item.author || '佚名'}`))
-                  currentIndex++
-                }
-              }
-              msgElements.push(h('message', '💡 请查看上述列表后，在当前会话直接回复序号进行下载，回复其他内容退出。'))
-
-              await session.send(h('message', { forward: true }, msgElements))
-            } else {
-              parts.push(formatComics(jmItems, '禁漫天堂'))
-              parts.push('')
-              parts.push(formatComics(bikaItems, '哔咔漫画'))
-              return parts.join('\n')
-            }
-          } else {
-            parts.push(`共找到 ${totalResults} 个结果：\n`)
-            let currentIndex = 1
-            if (jmItems.length > 0) {
-              parts.push('【 禁漫天堂 (JMComic) 】')
-              for (const item of jmItems) {
-                all.push(item)
-                parts.push(`  ${currentIndex}. [禁漫天堂] ${item.title}  作者:${item.author || '佚名'}`)
-                currentIndex++
-              }
-              parts.push('')
-            }
-
-            if (bikaItems.length > 0) {
-              parts.push('【 哔咔漫画 (Bika) 】')
-              for (const item of bikaItems) {
-                all.push(item)
-                parts.push(`  ${currentIndex}. [哔咔漫画] ${item.title}  作者:${item.author || '佚名'}`)
-                currentIndex++
-              }
-              parts.push('')
-            }
-
-            parts.push('输入序号（例如：1）或「源|ID」（例如：禁漫天堂|12345）进行下载')
-            if (session) {
-              await session.send(parts.join('\n'))
-            } else {
-              return parts.join('\n')
-            }
-          }
-
-          if (session) {
-            const answer = await session.prompt(30000)
-            if (!answer) return
-            const cleanAnswer = answer.trim()
-            let targetId = ''
-
-            const index = parseInt(cleanAnswer, 10)
-            if (!isNaN(index) && index > 0 && index <= all.length) {
-              const selected = all[index - 1]
-              targetId = selected.id
-            } else {
-              const match = cleanAnswer.match(/^(?:禁漫天堂|哔咔漫画|禁漫|哔咔|jm|bika)[|｜](.+)$/i)
-              if (match) {
-                targetId = match[1].trim()
-              } else {
-                targetId = cleanAnswer
-              }
-            }
-
-            if (targetId) {
-              return session.execute(`comic download ${targetId}`)
-            }
-            return
-          }
-        } else {
-          return '没有找到任何结果'
+        if (totalResults === 0) {
+          return `没有找到关于「${keyword}」的漫画。`
         }
+
+        // 统一编号：禁漫在前，哔咔在后，供回复序号下载
+        const all: (ComicItem & { source: string })[] = []
+        const jmLines: string[] = []
+        const bikaLines: string[] = []
+        let idx = 1
+        for (const item of jmItems) {
+          all.push(item)
+          jmLines.push(`${idx}. [禁漫天堂] ${item.title}  作者:${item.author || '佚名'} (ID: ${item.id})`)
+          idx++
+        }
+        for (const item of bikaItems) {
+          all.push(item)
+          bikaLines.push(`${idx}. [哔咔漫画] ${item.title}  作者:${item.author || '佚名'} (ID: ${item.id})`)
+          idx++
+        }
+
+        if (!session) {
+          // 无会话环境（理论上不会发生），降级为纯文本
+          const lines: string[] = []
+          if (jmLines.length) lines.push('【 禁漫天堂 (JMComic) 】', ...jmLines)
+          if (bikaLines.length) lines.push('【 哔咔漫画 (Bika) 】', ...bikaLines)
+          return lines.join('\n')
+        }
+
+        // 合并转发：禁漫一条、哔咔一条
+        const msgElements = []
+        let header = `🔍 关键词「${keyword}」共找到 ${totalResults} 个结果`
+        if (result.best_match?.title) {
+          const bm = result.best_match
+          const bmLabel = bm.source === 'jm' ? '禁漫天堂' : '哔咔漫画'
+          header += `\n🏆 最佳匹配 [${bmLabel}]: ${bm.title}`
+        }
+        msgElements.push(h('message', header))
+        if (jmLines.length) {
+          msgElements.push(h('message', `【 禁漫天堂 (JMComic) 】\n${jmLines.join('\n')}`))
+        }
+        if (bikaLines.length) {
+          msgElements.push(h('message', `【 哔咔漫画 (Bika) 】\n${bikaLines.join('\n')}`))
+        }
+        msgElements.push(h('message', '💡 回复序号下载（如 1），或回复「源|ID」（如 禁漫天堂|12345），回复其他内容退出。'))
+
+        await session.send(h('message', { forward: true }, msgElements))
+
+        const answer = await session.prompt(30000)
+        if (!answer) return
+        const cleanAnswer = answer.trim()
+        let targetId = ''
+
+        const index = parseInt(cleanAnswer, 10)
+        if (!isNaN(index) && index > 0 && index <= all.length && /^\d+$/.test(cleanAnswer)) {
+          targetId = all[index - 1].id
+        } else {
+          const match = cleanAnswer.match(/^(?:禁漫天堂|哔咔漫画|禁漫|哔咔|jm|bika)[|｜](.+)$/i)
+          if (match) {
+            targetId = match[1].trim()
+          } else {
+            return // 非有效输入，退出
+          }
+        }
+
+        if (targetId) {
+          return session.execute(`comic.download ${targetId}`)
+        }
+        return
       } catch (err: any) {
         logger.error('搜索失败:', err.message)
         return `搜索失败: ${err.message}`
@@ -370,7 +351,7 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // comic download <id> [chapterId]
-  ctx.command('comic download <id:string> [chapterId:string]', '下载漫画PDF')
+  ctx.command('comic.download <id:string> [chapterId:string]', '下载漫画PDF')
     .action(async ({ session }, id, chapterId) => {
       if (!id) return '用法: comic download <ID> [章节ID]'
       if (!session) return '此命令仅支持在会话中使用'
@@ -406,8 +387,16 @@ export function apply(ctx: Context, config: Config) {
       try {
         await session.send('正在获取漫画详情...')
 
-        const detail = await apiGet<ComicDetail>(`/api/comic/${source}/${targetId}`)
-        if (!detail?.title) return '未找到该漫画'
+        let detail: ComicDetail
+        try {
+          detail = await apiGet<ComicDetail>(`/api/comic/${source}/${targetId}`)
+        } catch (e: any) {
+          return `获取详情失败（后端请求出错）：${e.message}\n可能原因：comic-api 未启动、源站反爬拦截或 ID 不存在。`
+        }
+        if (!detail?.title) {
+          const srcLabel = source === 'jm' ? '禁漫天堂' : '哔咔漫画'
+          return `未找到该漫画 [${srcLabel} ID: ${targetId}]\n请确认 ID 是否正确；若是哔咔需先登录，禁漫可能被源站临时拦截。`
+        }
         if (!detail.chapters?.length) return '该漫画没有可下载的章节'
 
         const chapter = chapterId
@@ -477,149 +466,132 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // comic detail <id>
-  ctx.command('comic detail <id:text>', '查看漫画详情')
+  ctx.command('comic.detail <id:text>', '查看漫画详情')
     .action(async ({ session }, query) => {
       if (!query) return '用法: comic detail <关键词> 或 comic detail <ID>'
       if (!session) return '此命令仅支持在会话中使用'
 
+      // 直接给定 ID/源：只查该来源
       const resolved = determineSource(query)
       if (resolved) {
         return fetchAndShowDetail(session, resolved.source, resolved.id)
       }
 
+      // 关键词模式：禁漫和哔咔各取 best 匹配，分别展示详情
       try {
+        await session.send('正在搜索并获取详情...')
         const result = await apiGet<SearchResult>('/api/search', { keyword: query })
-        const jmList = result.all_results?.jm || []
-        const bikaList = result.all_results?.bika || []
-        const all = [
-          ...jmList.map(c => ({ ...c, source: 'jm' })),
-          ...bikaList.map(c => ({ ...c, source: 'bika' })),
-        ]
+        const jmBest = (result.all_results?.jm || [])[0]
+        const bikaBest = (result.all_results?.bika || [])[0]
 
-        if (all.length === 0) {
+        if (!jmBest && !bikaBest) {
           return `没有找到关于「${query}」的漫画。`
         }
 
-        if (all.length === 1) {
-          const chosen = all[0]
-          return fetchAndShowDetail(session, chosen.source, chosen.id)
-        }
+        const [jmText, bikaText] = await Promise.all([
+          jmBest ? buildDetailText('jm', jmBest.id) : Promise.resolve(null),
+          bikaBest ? buildDetailText('bika', bikaBest.id) : Promise.resolve(null),
+        ])
 
-        const parts: string[] = []
-        if (result.best_match?.title) {
-          const bm = result.best_match
-          const srcLabel = bm.source === 'jm' ? '禁漫天堂' : '哔咔漫画'
-          parts.push(`🏆 最佳匹配 [${srcLabel}]: ${bm.title}`)
-          parts.push('')
-        }
+        const msgElements = [
+          h('message', `🔍 关键词「${query}」各平台最相似结果详情：`),
+        ]
+        msgElements.push(h('message', jmText || '【 禁漫天堂 】无匹配结果'))
+        msgElements.push(h('message', bikaText || '【 哔咔漫画 】无匹配结果(或需先登录)'))
 
-        if (all.length > 5) {
-          parts.push(`找到 ${all.length} 个结果，已生成合并转发记录：`)
-          await session.send(parts.join('\n'))
-          const msgElements = all.map((c, i) => {
-            const src = c.source === 'jm' ? '禁漫天堂' : '哔咔漫画'
-            return h('message', `${i + 1}. [${src}] ${c.title}  作者:${c.author || '佚名'}`)
-          })
-          msgElements.push(h('message', `💡 请回复序号（1-${all.length}）查看详情，或回复其他任意内容退出。`))
-          await session.send(h('message', { forward: true }, msgElements))
-        } else {
-          parts.push(`找到以下多个结果，请回复序号（1-${all.length}）查看详情，或回复其他任意内容退出：`)
-          parts.push(formatComics(all))
-          await session.send(parts.join('\n'))
-        }
-
-        const answer = await session.prompt(30000)
-        if (!answer) return
-        const trimmed = answer.trim()
-        const index = parseInt(trimmed, 10)
-        if (!isNaN(index) && index >= 1 && index <= all.length) {
-          const chosen = all[index - 1]
-          return fetchAndShowDetail(session, chosen.source, chosen.id)
-        } else {
-          return '输入无效，已退出。'
-        }
+        await session.send(h('message', { forward: true }, msgElements))
+        return
       } catch (err: any) {
         logger.error('详情搜索失败:', err.message)
         return `查询失败: ${err.message}`
       }
     })
 
-  // comic leaderboard [mode]
-  ctx.command('comic leaderboard [mode:string]', '查看排行榜')
-    .action(async ({ session }, mode) => {
+  // comic leaderboard [mode] [page]
+  ctx.command('comic.leaderboard [mode:string] [page:number]', '查看排行榜')
+    .action(async ({ session }, mode, page) => {
+      if (!session) return '此命令仅支持在会话中使用'
+      // 未指定类型默认日榜（最新的当日榜单）
       const targetMode = (mode || 'day').toLowerCase()
       if (!['day', 'week', 'month', 'total'].includes(targetMode)) {
         return 'mode 必须是 day/week/month/total'
       }
+      const targetPage = Math.max(1, Math.floor(page || 1))
+      const query = { mode: targetMode, page: String(targetPage) }
 
       try {
         const [jmResult, bikaResult] = await Promise.all([
-          apiGet<ApiResponse<ComicItem[]>>('/api/jm/leaderboard', { mode: targetMode }).catch(() => null),
-          apiGet<ApiResponse<ComicItem[]>>('/api/bika/leaderboard', { mode: targetMode }).catch(() => null),
+          apiGet<ApiResponse<ComicItem[]>>('/api/jm/leaderboard', query).catch(() => null),
+          apiGet<ApiResponse<ComicItem[]>>('/api/bika/leaderboard', query).catch(() => null),
         ])
 
         const modeMap: Record<string, string> = { day: '日榜', week: '周榜', month: '月榜', total: '总榜' }
-        const parts: string[] = []
 
-        const formatLeaderboard = (comics: ComicItem[]): string => {
+        const formatList = (comics: ComicItem[]): string => {
           if (!comics || comics.length === 0) return '暂无数据或获取失败'
-          return comics.map((c, i) => {
-            return `${i + 1}. ${c.title}  作者:${c.author || '佚名'} (ID: ${c.id})`
-          }).join('\n')
+          return comics.map((c, i) => `${i + 1}. ${c.title}  作者:${c.author || '佚名'} (ID: ${c.id})`).join('\n')
         }
 
-        parts.push(`【 禁漫天堂 (JMComic) ${modeMap[targetMode]} 】`)
-        if (jmResult && jmResult.success !== false && jmResult.data?.length) {
-          parts.push(formatLeaderboard(jmResult.data))
-        } else {
-          parts.push('暂无数据或获取失败')
-        }
-        parts.push('')
+        const jmOk = jmResult && jmResult.success !== false && jmResult.data?.length
+        const bikaOk = bikaResult && bikaResult.success !== false && bikaResult.data?.length
+        const jmText = `【 禁漫天堂 (JMComic) ${modeMap[targetMode]} · 第${targetPage}页 】\n` + (jmOk ? formatList(jmResult!.data!) : '暂无数据或获取失败')
+        // 哔咔无总榜，自动回退日榜
+        const bikaModeLabel = targetMode === 'total' ? '日榜(哔咔无总榜)' : modeMap[targetMode]
+        const bikaText = `【 哔咔漫画 (Bika) ${bikaModeLabel} · 第${targetPage}页 】\n` + (bikaOk ? formatList(bikaResult!.data!) : '暂无数据或获取失败(哔咔需先登录)')
 
-        parts.push(`【 哔咔漫画 (Bika) ${modeMap[targetMode]} 】`)
-        if (bikaResult && bikaResult.success !== false && bikaResult.data?.length) {
-          parts.push(formatLeaderboard(bikaResult.data))
-        } else {
-          parts.push('暂无数据或获取失败')
-        }
-
-        return parts.join('\n')
+        // 禁漫、哔咔分成 2 条独立消息发送
+        await session.send(jmText)
+        await session.send(bikaText)
+        return
       } catch (err: any) {
         logger.error('获取排行榜失败:', err.message)
         return `获取排行榜失败: ${err.message}`
       }
     })
 
+  // 翻页累积拉取，直到达到 limit 条或没有更多（最多翻 maxPages 页防止狂刷后端）
+  async function fetchUpTo(source: string, endpoint: string, limit: number, maxPages = 5): Promise<ComicItem[]> {
+    const acc: ComicItem[] = []
+    for (let page = 1; page <= maxPages && acc.length < limit; page++) {
+      let res: ApiResponse<ComicItem[]> | null = null
+      try {
+        res = await apiGet<ApiResponse<ComicItem[]>>(`/api/${source}/${endpoint}`, { page: String(page) })
+      } catch {
+        break
+      }
+      if (!res || res.success === false || !res.data?.length) break
+      acc.push(...res.data)
+      if (res.data.length === 0) break
+    }
+    return acc.slice(0, limit)
+  }
+
   // comic latest
-  ctx.command('comic latest', '查看最近更新')
+  ctx.command('comic.latest', '查看最近更新')
     .alias('最新漫画')
     .alias('漫画更新')
-    .action(async ({ session }) => {
+    .option('number', '-n <count:number> 每个平台显示数量(默认10，最多50)')
+    .action(async ({ session, options }) => {
       if (!session) return '此命令仅支持在会话中使用'
+      const limit = Math.min(50, Math.max(1, Math.floor(options?.number || 10)))
 
       try {
-        const [jmResult, bikaResult] = await Promise.all([
-          apiGet<ApiResponse<ComicItem[]>>('/api/jm/latest').catch(() => null),
-          apiGet<ApiResponse<ComicItem[]>>('/api/bika/latest').catch(() => null),
+        const [jmItems, bikaItems] = await Promise.all([
+          fetchUpTo('jm', 'latest', limit).catch(() => []),
+          fetchUpTo('bika', 'latest', limit).catch(() => []),
         ])
 
-        const formatLatest = (comics: ComicItem[]): string => {
+        const formatList = (comics: ComicItem[]): string => {
           if (!comics || comics.length === 0) return '暂无数据或获取失败'
-          const list = comics.slice(0, 20)
-          return list.map((c, i) => {
-            return `${i + 1}. ${c.title}  作者:${c.author || '佚名'} (ID: ${c.id})`
-          }).join('\n')
+          return comics.map((c, i) => `${i + 1}. ${c.title}  作者:${c.author || '佚名'} (ID: ${c.id})`).join('\n')
         }
 
-        const jmText = `【 禁漫天堂 (JMComic) 最近更新 】\n` + (jmResult && jmResult.success !== false && jmResult.data?.length ? formatLatest(jmResult.data) : '暂无数据或获取失败')
-        const bikaText = `【 哔咔漫画 (Bika) 最近更新 】\n` + (bikaResult && bikaResult.success !== false && bikaResult.data?.length ? formatLatest(bikaResult.data) : '暂无数据或获取失败')
+        const jmText = `【 禁漫天堂 (JMComic) 最近更新 · ${jmItems.length}条 】\n` + formatList(jmItems)
+        const bikaText = `【 哔咔漫画 (Bika) 最近更新 · ${bikaItems.length}条 】\n` + (bikaItems.length ? formatList(bikaItems) : '暂无数据或获取失败(哔咔需先登录)')
 
-        const msgElements = [
-          h('message', jmText),
-          h('message', bikaText)
-        ]
-
-        await session.send(h('message', { forward: true }, msgElements))
+        // 禁漫、哔咔分成 2 条独立消息发送
+        await session.send(jmText)
+        await session.send(bikaText)
         return
       } catch (err: any) {
         logger.error('获取最近更新失败:', err.message)
@@ -627,26 +599,53 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // comic random
-  ctx.command('comic random', '随机推荐漫画')
-    .alias('随机漫画')
-    .action(async ({ session }) => {
-      const source = Math.random() < 0.5 ? 'jm' : 'bika'
+  // 随机推荐：多次调用累积去重，直到达到 limit 条或尝试上限
+  async function fetchRandomUpTo(source: string, limit: number, maxTries = 4): Promise<ComicItem[]> {
+    const map = new Map<string, ComicItem>()
+    for (let i = 0; i < maxTries && map.size < limit; i++) {
+      let res: ApiResponse<ComicItem[]> | null = null
       try {
-        const result = await apiGet<ApiResponse<ComicItem[]>>(`/api/${source}/random`)
-        const srcLabel = source === 'jm' ? '禁漫天堂' : '哔咔漫画'
-        if (result && result.success !== false && result.data?.length) {
-          const comic = result.data[Math.floor(Math.random() * result.data.length)]
-          if (comic?.title) {
-            return `🎲 随机推荐 [${srcLabel}]\n书名: ${comic.title}\n作者: ${comic.author || '佚名'}\nID: ${comic.id}\n(如需下载，请输入 comic.download ${comic.id})`
-          }
-        }
-        return `${srcLabel} 随机推荐暂无数据`
-      } catch (err: any) {
-        const srcLabel = source === 'jm' ? '禁漫天堂' : '哔咔漫画'
-        logger.error(`获取${srcLabel}随机推荐失败:`, err.message)
-        return `获取随机推荐失败: ${err.message}`
+        res = await apiGet<ApiResponse<ComicItem[]>>(`/api/${source}/random`)
+      } catch {
+        break
       }
+      if (!res || res.success === false || !res.data?.length) break
+      for (const item of res.data) {
+        if (item?.id && !map.has(item.id)) map.set(item.id, item)
+      }
+    }
+    return Array.from(map.values()).slice(0, limit)
+  }
+
+  // comic random
+  ctx.command('comic.random', '随机推荐漫画')
+    .alias('随机漫画')
+    .option('number', '-n <count:number> 每个平台推荐数量(默认5，最多20)')
+    .action(async ({ session, options }) => {
+      const limit = Math.min(20, Math.max(1, Math.floor(options?.number || 5)))
+
+      const [jmItems, bikaItems] = await Promise.all([
+        fetchRandomUpTo('jm', limit).catch(() => []),
+        fetchRandomUpTo('bika', limit).catch(() => []),
+      ])
+
+      const formatList = (comics: ComicItem[], label: string): string => {
+        if (!comics || comics.length === 0) return `【 ${label} 】暂无数据或获取失败`
+        const lines = comics.map((c, i) => `${i + 1}. [${label}] ${c.title}  作者:${c.author || '佚名'} (ID: ${c.id})`)
+        return `🎲 ${label} 随机推荐 · ${comics.length}个\n${lines.join('\n')}`
+      }
+
+      const jmText = formatList(jmItems, '禁漫天堂')
+      const bikaText = bikaItems.length ? formatList(bikaItems, '哔咔漫画') : '🎲 哔咔漫画 随机推荐\n暂无数据或获取失败(哔咔需先登录)'
+
+      if (session) {
+        // 禁漫、哔咔分成 2 条独立消息发送
+        await session.send(jmText)
+        await session.send(bikaText)
+        await session.send('💡 如需下载，请使用 comic download <ID>')
+        return
+      }
+      return [jmText, '', bikaText].join('\n')
     })
 
   // ========== ChatLuna 工具注册 ==========
@@ -705,7 +704,7 @@ function createComicTool(ctx: Context, cfg: Config) {
 
   return tool(async (input: any, runConfig?: any) => {
     const logger = ctx.logger('comic')
-    const source = input.source || cfg.defaultSource || 'jm'
+    const source = input.source || 'jm'
     const apiBase = cfg.apiBase.replace(/\/+$/, '')
 
     const apiGet = async <T = any>(path: string, params?: Record<string, string>): Promise<T> => {
