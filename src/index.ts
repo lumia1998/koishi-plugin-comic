@@ -166,7 +166,7 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // Parent command 'comic' routing logic
-  ctx.command('comic [keyword:text]', '聚合漫画搜索与下载。若用户给的名字不准确、包含缩写或搜不到，请调用联网工具搜索获取准确的漫画名称、关联角色或作者，然后再进行搜索或下载。')
+  ctx.command('comic [keyword:text]', '聚合漫画搜索与直接下载')
     .action(async ({ session }, keyword) => {
       if (!session) return
       if (!keyword) {
@@ -177,13 +177,13 @@ export function apply(ctx: Context, config: Config) {
       const resolved = determineSource(clean)
       if (resolved) {
         if (resolved.source === 'jm' && parseInt(resolved.id, 10) <= 100) {
-          return session.execute(`comic.search ${keyword}`)
+          return session.execute(`comic search ${keyword}`)
         }
-        return session.execute(`comic.download ${resolved.id}`)
+        return session.execute(`comic download ${resolved.id}`)
       }
       
       // Fallback to search
-      return session.execute(`comic.search ${keyword}`)
+      return session.execute(`comic search ${keyword}`)
     })
 
   async function fetchAndShowDetail(session: any, source: string, id: string): Promise<string | void> {
@@ -205,7 +205,7 @@ export function apply(ctx: Context, config: Config) {
         const first = detail.chapters[0]
         parts.push(`\n第一话: [${first.id}] ${first.name}`)
         if (detail.chapters.length > 1) {
-          parts.push(`共 ${detail.chapters.length} 话，如需下载请使用 comic.download <ID> [章节ID]`)
+          parts.push(`共 ${detail.chapters.length} 话，如需下载请使用 comic download <ID> [章节ID]`)
         }
       }
 
@@ -216,10 +216,8 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // comic.search <keyword>
-  ctx.command('comic.search <keyword:text>', '聚合搜索漫画（禁漫+哔咔）。若漫画名称模糊、拼写错误或搜不到，请先调用联网工具搜索获取其准确别名、正式标题或作者后，再重试搜索。')
-    .alias('搜漫画')
-    .alias('漫画搜索')
+  // comic search <keyword>
+  ctx.command('comic search <keyword:text>', '聚合搜索漫画')
     .action(async ({ session }, keyword) => {
       if (!keyword) return '请输入搜索关键词'
 
@@ -358,7 +356,7 @@ export function apply(ctx: Context, config: Config) {
             }
 
             if (targetId) {
-              return session.execute(`comic.download ${targetId}`)
+              return session.execute(`comic download ${targetId}`)
             }
             return
           }
@@ -371,11 +369,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // comic.download <id> [chapterId]
-  ctx.command('comic.download <id:string> [chapterId:string]', '下载漫画PDF。可接受漫画ID或本子名字。提示：若名字不准确、带有缩写或搜不到，可先调用联网工具搜索获取准确本子名、角色或关联画师，再进行下载。')
-    .alias('下载漫画')
-    .alias('漫画下载')
-    .alias('comic dl')
+  // comic download <id> [chapterId]
+  ctx.command('comic download <id:string> [chapterId:string]', '下载漫画PDF')
     .action(async ({ session }, id, chapterId) => {
       if (!id) return '用法: comic download <ID> [章节ID]'
       if (!session) return '此命令仅支持在会话中使用'
@@ -481,9 +476,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // comic.detail <query>
-  ctx.command('comic.detail <query:text>', '查看漫画详情和章节列表（支持关键词搜索或 ID 直接查询）')
-    .alias('漫画详情')
+  // comic detail <id>
+  ctx.command('comic detail <id:text>', '查看漫画详情')
     .action(async ({ session }, query) => {
       if (!query) return '用法: comic detail <关键词> 或 comic detail <ID>'
       if (!session) return '此命令仅支持在会话中使用'
@@ -550,10 +544,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // comic.leaderboard [mode]
-  ctx.command('comic.leaderboard [mode:string]', '查看排行榜')
-    .alias('漫画榜单')
-    .alias('漫画排行')
+  // comic leaderboard [mode]
+  ctx.command('comic leaderboard [mode:string]', '查看排行榜')
     .action(async ({ session }, mode) => {
       const targetMode = (mode || 'day').toLowerCase()
       if (!['day', 'week', 'month', 'total'].includes(targetMode)) {
@@ -598,8 +590,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // comic.latest
-  ctx.command('comic.latest', '查看最近更新')
+  // comic latest
+  ctx.command('comic latest', '查看最近更新')
     .alias('最新漫画')
     .alias('漫画更新')
     .action(async ({ session }) => {
@@ -635,8 +627,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // comic.random
-  ctx.command('comic.random', '随机推荐漫画')
+  // comic random
+  ctx.command('comic random', '随机推荐漫画')
     .alias('随机漫画')
     .action(async ({ session }) => {
       const source = Math.random() < 0.5 ? 'jm' : 'bika'
