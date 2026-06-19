@@ -45,11 +45,6 @@ export interface Config {
   pdfPassword?: string
   pdfSendMethod: 'buffer' | 'file'
   fileSendPath: string
-  tool: {
-    enabled: boolean
-    name: string
-    description: string
-  }
 }
 
 export const Config = Schema.object({
@@ -71,13 +66,6 @@ export const Config = Schema.object({
   fileSendPath: Schema.string()
     .description('PDF 发送方式为 file 时的本地中转保存目录')
     .default('/koishi/temp'),
-  tool: Schema.object({
-    enabled: Schema.boolean().default(true).description('开启后自动注册 ChatLuna 工具'),
-    name: Schema.string().default('comic').description('工具名称'),
-    description: Schema.string()
-      .default('漫画搜索与下载工具。支持禁漫天堂(JM)和哔咔漫画(Bika)双平台。包含动作：search (搜索), detail (查看详情), leaderboard (排行榜), latest (最近更新), random (随机推荐), download (下载本子并发送)。提示：如果用户给出的本子名、角色名或关键词模糊、包含缩写或拼写不够精确，或者使用该工具搜索未返回结果，你必须先调用联网搜索工具检索获取该本子的准确正式名称、画师/作者或完整标题，然后再用精准的关键词调用此工具。')
-      .description('工具描述'),
-  }).description('ChatLuna 工具设置'),
 })
 
 function getPdfPassword(source: string, comicId: string, chapterId: string): string {
@@ -650,90 +638,45 @@ export function apply(ctx: Context, config: Config) {
 
   // ========== ChatLuna 工具注册 ==========
   ctx.on('ready', async () => {
-    if (!config.tool.enabled) return
     if (!ctx.chatluna) {
       logger.info('chatluna 未安装，跳过注册 ChatLuna 工具')
       return
     }
-    const toolName = (config.tool.name || 'comic').trim() || 'comic'
-    ctx.chatluna.platform.registerTool(toolName, {
-      description: config.tool.description || '漫画搜索与下载工具',
-      selector() {
-        return true
-      },
-      createTool() {
-        return createComicTool(ctx, config)
-      },
-      meta: {
-        source: 'extension',
-        group: 'comic',
-        tags: ['comic', 'manga', 'jmcomic', 'bika'],
-        defaultAvailability: {
-          enabled: true,
-          main: true,
-          chatluna: true,
-          characterScope: 'all',
+    const chatluna = ctx.chatluna
+
+    const registerSingleTool = (name: string, description: string, schema: any, run: (input: any, runConfig?: any) => Promise<string>) => {
+      chatluna.platform.registerTool(name, {
+        description,
+        selector() {
+          return true
         },
-      },
-    })
-    logger.info(`ChatLuna 工具「${toolName}」已注册`)
-  })
-
-}
-
-const comicToolSchema = z.object({
-  action: z.enum(['search', 'detail', 'leaderboard', 'latest', 'random', 'download'])
-    .describe('操作类型：search=搜索, detail=详情, leaderboard=排行榜, latest=最近更新, random=随机推荐, download=下载漫画/本子并发送给用户'),
-  keyword: z.string().optional()
-    .describe('搜索关键词（action=search 时必填）'),
-  source: z.enum(['jm', 'bika']).optional()
-    .describe('漫画源：jm=禁漫天堂, bika=哔咔漫画。不填则根据需要自动检测或使用默认源'),
-  comic_id: z.string().optional()
-    .describe('漫画ID（action=detail 或 action=download 时必填）'),
-  chapter_id: z.string().optional()
-    .describe('章节ID（action=download 时选填，不填默认下载第一话）'),
-  mode: z.enum(['day', 'week', 'month', 'total']).optional()
-    .describe('排行榜时间维度（action=leaderboard 时使用）：day=日榜, week=周榜, month=月榜, total=总榜'),
-  page: z.number().int().min(1).optional()
-    .describe('页码，默认1'),
-})
-
-function createComicTool(ctx: Context, cfg: Config) {
-  const description = (cfg.tool.description || '').trim() || '漫画搜索与下载工具。支持禁漫天堂(JM)和哔咔漫画(Bika)双平台。包含动作：search (搜索), detail (查看详情), leaderboard (排行榜), latest (最近更新), random (随机推荐), download (下载本子并发送)。提示：如果用户给出的本子名、角色名或关键词模糊、包含缩写或拼写不够精确，或者使用该工具搜索未返回结果，你必须先调用联网搜索工具检索获取该本子的准确正式名称、画师/作者或完整标题，然后再用精准的关键词调用此工具。'
-  const name = (cfg.tool.name || 'comic').trim() || 'comic'
-
-  return tool(async (input: any, runConfig?: any) => {
-    const logger = ctx.logger('comic')
-    const source = input.source || 'jm'
-    const apiBase = cfg.apiBase.replace(/\/+$/, '')
-
-    const apiGet = async <T = any>(path: string, params?: Record<string, string>): Promise<T> => {
-      let url = apiBase + path
-      if (params) {
-        const qs = new URLSearchParams(params).toString()
-        if (qs) url += '?' + qs
-      }
-      return ctx.http.get(url) as Promise<T>
+        createTool() {
+          return tool(run, { name, description, schema })
+        },
+        meta: {
+          source: 'extension',
+          group: 'comic',
+          tags: ['comic', 'manga', 'jmcomic', 'bika'],
+          defaultAvailability: {
+            enabled: true,
+            main: true,
+            chatluna: true,
+            characterScope: 'all',
+          },
+        },
+      })
+      logger.info(`ChatLuna 工具「${name}」已注册`)
     }
 
-    try {
-      switch (input.action) {
-        case 'download': {
-          if (!input.comic_id) {
-            return JSON.stringify({ error: '下载漫画时 comic_id 不能为空' })
-          }
-          const session = runConfig?.configurable?.session
-          if (!session) {
-            return JSON.stringify({ error: '无法获取当前会话，不支持下载操作。请让用户在聊天界面直接使用 comic 命令或 comic.download 命令手动下载。' })
-          }
-          const cmd = input.chapter_id ? `comic.download ${input.comic_id} ${input.chapter_id}` : `comic.download ${input.comic_id}`
-          session.execute(cmd)
-          return JSON.stringify({ success: true, message: `已在后台启动漫画下载，命令为: ${cmd}。请告知用户正在下载，并让其留意后续接收的 PDF 文件与密码。` })
-        }
-        case 'search': {
-          if (!input.keyword) {
-            return JSON.stringify({ error: '搜索时 keyword 不能为空' })
-          }
+    // 1. comic_search
+    registerSingleTool(
+      'comic_search',
+      '搜索漫画，支持禁漫天堂(JM)和哔咔漫画(Bika)双平台聚合搜索。提示：如果用户给出的本子名、角色名或关键词模糊，或搜索未返回结果，必须先调用联网搜索工具检索获取该本子的准确正式名称或完整标题，然后再用精准的关键词调用此工具。',
+      z.object({
+        keyword: z.string().describe('搜索关键词'),
+      }),
+      async (input) => {
+        try {
           const result = await apiGet<SearchResult>('/api/search', { keyword: input.keyword })
           const jmList = result.all_results?.jm || []
           const bikaList = result.all_results?.bika || []
@@ -747,11 +690,24 @@ function createComicTool(ctx: Context, cfg: Config) {
             total: all.length,
             results: all.slice(0, 20),
           })
+        } catch (err: any) {
+          logger.error('工具 comic_search 调用失败:', err.message)
+          return JSON.stringify({ error: err.message || '请求失败' })
         }
-        case 'detail': {
-          if (!input.comic_id) {
-            return JSON.stringify({ error: '查看详情时 comic_id 不能为空' })
-          }
+      }
+    )
+
+    // 2. comic_detail
+    registerSingleTool(
+      'comic_detail',
+      '查看指定来源和ID的漫画详情，包括标题、作者、简介以及可下载的章节列表。',
+      z.object({
+        comic_id: z.string().describe('漫画ID'),
+        source: z.enum(['jm', 'bika']).optional().default('jm').describe('漫画源：jm=禁漫天堂, bika=哔咔漫画。默认jm。'),
+      }),
+      async (input) => {
+        try {
+          const source = input.source || 'jm'
           const detail = await apiGet<ComicDetail>(`/api/comic/${source}/${input.comic_id}`)
           if (!detail?.title) {
             return JSON.stringify({ error: '未找到该漫画' })
@@ -764,8 +720,25 @@ function createComicTool(ctx: Context, cfg: Config) {
             chapter_count: detail.chapters?.length || 0,
             chapters: detail.chapters?.slice(0, 30) || [],
           })
+        } catch (err: any) {
+          logger.error('工具 comic_detail 调用失败:', err.message)
+          return JSON.stringify({ error: err.message || '请求失败' })
         }
-        case 'leaderboard': {
+      }
+    )
+
+    // 3. comic_leaderboard
+    registerSingleTool(
+      'comic_leaderboard',
+      '查看指定漫画源的排行榜。',
+      z.object({
+        source: z.enum(['jm', 'bika']).optional().default('jm').describe('漫画源：jm=禁漫天堂, bika=哔咔漫画。默认jm。'),
+        mode: z.enum(['day', 'week', 'month', 'total']).optional().default('day').describe('排行榜时间维度：day=日榜, week=周榜, month=月榜, total=总榜。默认day。'),
+        page: z.number().int().min(1).optional().default(1).describe('页码，默认1。'),
+      }),
+      async (input) => {
+        try {
+          const source = input.source || 'jm'
           const mode = input.mode || 'day'
           const page = String(input.page || 1)
           const result = await apiGet<ApiResponse<ComicItem[]>>(`/api/${source}/leaderboard`, { mode, page })
@@ -776,8 +749,24 @@ function createComicTool(ctx: Context, cfg: Config) {
             total: result.data?.length || 0,
             results: result.data || [],
           })
+        } catch (err: any) {
+          logger.error('工具 comic_leaderboard 调用失败:', err.message)
+          return JSON.stringify({ error: err.message || '请求失败' })
         }
-        case 'latest': {
+      }
+    )
+
+    // 4. comic_latest
+    registerSingleTool(
+      'comic_latest',
+      '查看指定漫画源的最近更新列表。',
+      z.object({
+        source: z.enum(['jm', 'bika']).optional().default('jm').describe('漫画源：jm=禁漫天堂, bika=哔咔漫画。默认jm。'),
+        page: z.number().int().min(1).optional().default(1).describe('页码，默认1。'),
+      }),
+      async (input) => {
+        try {
+          const source = input.source || 'jm'
           const page = String(input.page || 1)
           const result = await apiGet<ApiResponse<ComicItem[]>>(`/api/${source}/latest`, { page })
           return JSON.stringify({
@@ -786,24 +775,58 @@ function createComicTool(ctx: Context, cfg: Config) {
             total: result.data?.length || 0,
             results: result.data || [],
           })
+        } catch (err: any) {
+          logger.error('工具 comic_latest 调用失败:', err.message)
+          return JSON.stringify({ error: err.message || '请求失败' })
         }
-        case 'random': {
+      }
+    )
+
+    // 5. comic_random
+    registerSingleTool(
+      'comic_random',
+      '随机推荐指定漫画源的漫画。',
+      z.object({
+        source: z.enum(['jm', 'bika']).optional().default('jm').describe('漫画源：jm=禁漫天堂, bika=哔咔漫画。默认jm。'),
+      }),
+      async (input) => {
+        try {
+          const source = input.source || 'jm'
           const result = await apiGet<ApiResponse<ComicItem[]>>(`/api/${source}/random`)
           return JSON.stringify({
             source,
             result: result.data || null,
           })
+        } catch (err: any) {
+          logger.error('工具 comic_random 调用失败:', err.message)
+          return JSON.stringify({ error: err.message || '请求失败' })
         }
-        default:
-          return JSON.stringify({ error: '未知操作类型' })
       }
-    } catch (err: any) {
-      logger.error('工具调用失败:', err.message)
-      return JSON.stringify({ error: err.message || '请求失败' })
-    }
-  }, {
-    name,
-    description,
-    schema: comicToolSchema as any,
-  }) as any
+    )
+
+    // 6. comic_download
+    registerSingleTool(
+      'comic_download',
+      '下载指定ID的漫画并发送给用户。会自动启动后台下载并向用户发送PDF文件及解密密码。',
+      z.object({
+        comic_id: z.string().describe('漫画ID'),
+        chapter_id: z.string().optional().describe('章节ID（选填，不填默认下载第一话）'),
+      }),
+      async (input, runConfig) => {
+        try {
+          const session = runConfig?.configurable?.session
+          if (!session) {
+            return JSON.stringify({ error: '无法获取当前会话，不支持下载操作。请让用户在聊天界面直接使用 comic 命令或 comic.download 命令手动下载。' })
+          }
+          const cmd = input.chapter_id ? `comic.download ${input.comic_id} ${input.chapter_id}` : `comic.download ${input.comic_id}`
+          session.execute(cmd)
+          return JSON.stringify({ success: true, message: `已在后台启动漫画下载，命令为: ${cmd}。请告知用户正在下载，并让其留意后续接收的 PDF 文件与密码。` })
+        } catch (err: any) {
+          logger.error('工具 comic_download 调用失败:', err.message)
+          return JSON.stringify({ error: err.message || '请求失败' })
+        }
+      }
+    )
+  })
+
 }
