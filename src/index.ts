@@ -34,7 +34,8 @@ declare module 'koishi' {
 }
 
 export const inject = {
-  required: ['http', 'chatluna'],
+  required: ['http'],
+  optional: ['chatluna'],
 }
 
 export const usage = `
@@ -1023,8 +1024,8 @@ export function apply(ctx: Context, config: Config) {
     }) as any
   }
 
-  // ========== ChatLuna 工具注册 ==========
-  ctx.on('ready', async () => {
+  // Re-register tools whenever the optional ChatLuna service is loaded or reloaded.
+  ctx.inject(['chatluna'], (ctx) => {
     const meta = {
       source: 'extension' as const,
       group: 'comic',
@@ -1037,83 +1038,44 @@ export function apply(ctx: Context, config: Config) {
       },
     }
 
-    if (config.comicSearchTool.enabled) {
-      const toolName = config.comicSearchTool.name || 'comic_search'
-      ctx.effect(() =>
-        ctx.chatluna.platform.registerTool(toolName, {
-          description: config.comicSearchTool.description || '搜索漫画',
-          selector() { return true },
-          createTool() { return createComicSearchTool(config) },
-          meta,
-        })
-      )
-      logger.info(`ChatLuna 工具「${toolName}」已注册`)
-    }
+    const tools = [
+      [config.comicSearchTool, 'comic_search', '搜索漫画', () => createComicSearchTool(config)],
+      [config.comicDetailTool, 'comic_detail', '查看漫画详情', () => createComicDetailTool(config)],
+      [config.comicLeaderboardTool, 'comic_leaderboard', '查看漫画排行榜', () => createComicLeaderboardTool(config)],
+      [config.comicLatestTool, 'comic_latest', '查看最近更新的漫画', () => createComicLatestTool(config)],
+      [config.comicRandomTool, 'comic_random', '随机推荐漫画', () => createComicRandomTool(config)],
+      [config.comicDownloadTool, 'comic_download', '下载漫画/本子并发送给用户', () => createComicDownloadTool(config)],
+    ] as const
 
-    if (config.comicDetailTool.enabled) {
-      const toolName = config.comicDetailTool.name || 'comic_detail'
-      ctx.effect(() =>
-        ctx.chatluna.platform.registerTool(toolName, {
-          description: config.comicDetailTool.description || '查看漫画详情',
-          selector() { return true },
-          createTool() { return createComicDetailTool(config) },
-          meta,
-        })
-      )
-      logger.info(`ChatLuna 工具「${toolName}」已注册`)
-    }
+    ctx.effect(() => {
+      const chatluna = ctx.get('chatluna')
+      const registerTool = chatluna?.platform?.registerTool
+      if (!registerTool) {
+        logger.warn('ChatLuna platform service is missing, skip comic tool registration')
+        return () => {}
+      }
 
-    if (config.comicLeaderboardTool.enabled) {
-      const toolName = config.comicLeaderboardTool.name || 'comic_leaderboard'
-      ctx.effect(() =>
-        ctx.chatluna.platform.registerTool(toolName, {
-          description: config.comicLeaderboardTool.description || '查看漫画排行榜',
-          selector() { return true },
-          createTool() { return createComicLeaderboardTool(config) },
-          meta,
-        })
-      )
-      logger.info(`ChatLuna 工具「${toolName}」已注册`)
-    }
+      const disposers: Array<() => void> = []
+      for (const [toolConfig, defaultName, defaultDescription, createTool] of tools) {
+        if (!toolConfig.enabled) continue
+        const toolName = toolConfig.name || defaultName
+        try {
+          disposers.push(registerTool.call(chatluna.platform, toolName, {
+            description: toolConfig.description || defaultDescription,
+            selector() { return true },
+            createTool,
+            meta,
+          }))
+          logger.info(`ChatLuna 工具「${toolName}」已注册`)
+        } catch (error) {
+          logger.warn(`注册 ChatLuna 工具「${toolName}」失败: ${error instanceof Error ? error.message : error}`)
+        }
+      }
 
-    if (config.comicLatestTool.enabled) {
-      const toolName = config.comicLatestTool.name || 'comic_latest'
-      ctx.effect(() =>
-        ctx.chatluna.platform.registerTool(toolName, {
-          description: config.comicLatestTool.description || '查看最近更新的漫画',
-          selector() { return true },
-          createTool() { return createComicLatestTool(config) },
-          meta,
-        })
-      )
-      logger.info(`ChatLuna 工具「${toolName}」已注册`)
-    }
-
-    if (config.comicRandomTool.enabled) {
-      const toolName = config.comicRandomTool.name || 'comic_random'
-      ctx.effect(() =>
-        ctx.chatluna.platform.registerTool(toolName, {
-          description: config.comicRandomTool.description || '随机推荐漫画',
-          selector() { return true },
-          createTool() { return createComicRandomTool(config) },
-          meta,
-        })
-      )
-      logger.info(`ChatLuna 工具「${toolName}」已注册`)
-    }
-
-    if (config.comicDownloadTool.enabled) {
-      const toolName = config.comicDownloadTool.name || 'comic_download'
-      ctx.effect(() =>
-        ctx.chatluna.platform.registerTool(toolName, {
-          description: config.comicDownloadTool.description || '下载漫画/本子并发送给用户',
-          selector() { return true },
-          createTool() { return createComicDownloadTool(config) },
-          meta,
-        })
-      )
-      logger.info(`ChatLuna 工具「${toolName}」已注册`)
-    }
+      return () => {
+        for (const dispose of disposers) dispose?.()
+      }
+    })
   })
 
 }
