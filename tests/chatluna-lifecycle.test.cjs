@@ -11,10 +11,11 @@ function tool(name, enabled = false) {
 function config() {
   return {
     apiBase: 'http://127.0.0.1:8699',
-    concurrency: 4,
     logInfo: false,
+    downloadTimeout: 600,
     pdfSendMethod: 'buffer',
     fileSendPath: '/tmp',
+    comicSourcesTool: tool('comic_sources'),
     comicSearchTool: tool('comic_search', true),
     comicDetailTool: tool('comic_detail'),
     comicLeaderboardTool: tool('comic_leaderboard'),
